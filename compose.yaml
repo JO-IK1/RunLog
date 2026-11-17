@@ -1,0 +1,91 @@
+name: runlog
+x-app: &app
+  build: .
+  environment: &env
+    POSTGRES_URL: postgres://runlog:runlog@postgres:5432/runlog?sslmode=disable
+    MONGO_URL: mongodb://mongo:27017
+    MONGO_DATABASE: runlog
+    KAFKA_BROKERS: kafka:9092
+    KAFKA_TOPIC: runlog.events
+  restart: on-failure
+  stop_grace_period: 25s
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_USER: runlog
+      POSTGRES_PASSWORD: runlog
+      POSTGRES_DB: runlog
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U runlog -d runlog"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  mongo:
+    image: mongo:8.0.16
+    volumes: ["mongo-data:/data/db"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+  kafka-permissions:
+    image: alpine:3.23
+    user: "0:0"
+    command: ["chown", "1000:1000", "/data"]
+    volumes: ["kafka-data:/data"]
+    restart: "no"
+  kafka:
+    depends_on:
+      kafka-permissions: {condition: service_completed_successfully}
+    image: apache/kafka:4.1.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    volumes: ["kafka-data:/tmp/kraft-combined-logs"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+  kafka-init:
+    image: apache/kafka:4.1.0
+    depends_on:
+      kafka: {condition: service_healthy}
+    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
+    command: ["--bootstrap-server", "kafka:9092", "--create", "--if-not-exists", "--topic", "runlog.events", "--partitions", "3", "--replication-factor", "1", "--config", "retention.ms=604800000"]
+  migrate:
+    <<: *app
+    command: ["migrate"]
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+  api:
+    <<: *app
+    command: ["api"]
+    ports: ["127.0.0.1:8080:8080"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      mongo: {condition: service_healthy}
+      kafka-init: {condition: service_completed_successfully}
+  consumer:
+    <<: *app
+    command: ["consumer"]
+    depends_on:
+      mongo: {condition: service_healthy}
+      kafka-init: {condition: service_completed_successfully}
+volumes:
+  postgres-data:
+  mongo-data:
+  kafka-data:
